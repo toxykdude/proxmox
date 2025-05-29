@@ -18,7 +18,7 @@ backup_vms() {
     
     for VMID in $VM_IDS; do
         echo "Backing up VM $VMID..."
-        vzdump $VMID --dumpdir $BACKUP_PATH --mode snapshot --compress lzo --node $(hostname) --storage local
+        vzdump $VMID --dumpdir "$BACKUP_PATH" --mode snapshot --compress lzo --node $(hostname)
     done
 }
 
