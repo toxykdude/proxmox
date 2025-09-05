@@ -6,10 +6,8 @@
 # Source: https://supabase.com/
 # GitHub: https://github.com/toxykdude/proxmox
 
-source <(curl -fsSL https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/misc/build.func)
-
-# Override default setting
 function header_info {
+clear
 cat <<"EOF"
    _____                  __                    
   / ___/__  ______  ____ / /_  ____ __________ 
@@ -20,8 +18,6 @@ cat <<"EOF"
 
 EOF
 }
-header_info
-echo -e "Loading..."
 
 # App Variable(s)
 APP="Supabase"
@@ -31,343 +27,191 @@ var_disk="8"
 var_os="ubuntu"
 var_version="22.04"
 var_unprivileged="1"
+var_install="supabase"
+
+# Show user information
+header_info
+echo -e "Loading..."
+
+# Import build functions with modifications for custom repository
+source <(curl -fsSL https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/misc/build.func)
+
+# Override the build_container function to use our custom install script URL
+build_container() {
+  NET_STRING="-net0 name=eth0,bridge=$BRG$MAC,ip=$NET$GATE$VLAN$MTU"
+  case "$IPV6_METHOD" in
+  auto) NET_STRING="$NET_STRING,ip6=auto" ;;
+  dhcp) NET_STRING="$NET_STRING,ip6=dhcp" ;;
+  static)
+    NET_STRING="$NET_STRING,ip6=$IPV6_ADDR"
+    [ -n "$IPV6_GATE" ] && NET_STRING="$NET_STRING,gw6=$IPV6_GATE"
+    ;;
+  none) ;;
+  esac
+  if [ "$CT_TYPE" == "1" ]; then
+    FEATURES="keyctl=1,nesting=1"
+  else
+    FEATURES="nesting=1"
+  fi
+
+  if [ "$ENABLE_FUSE" == "yes" ]; then
+    FEATURES="$FEATURES,fuse=1"
+  fi
+
+  if [[ $DIAGNOSTICS == "yes" ]]; then
+    post_to_api
+  fi
+
+  TEMP_DIR=$(mktemp -d)
+  pushd "$TEMP_DIR" >/dev/null
+  
+  # Use the standard install.func for most functionality
+  if [ "$var_os" == "alpine" ]; then
+    export FUNCTIONS_FILE_PATH="$(curl -fsSL https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/misc/alpine-install.func)"
+  else
+    export FUNCTIONS_FILE_PATH="$(curl -fsSL https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/misc/install.func)"
+  fi
+
+  export DIAGNOSTICS="$DIAGNOSTICS"
+  export RANDOM_UUID="$RANDOM_UUID"
+  export CACHER="$APT_CACHER"
+  export CACHER_IP="$APT_CACHER_IP"
+  export tz="$timezone"
+  export APPLICATION="$APP"
+  export app="$NSAPP"
+  export PASSWORD="$PW"
+  export VERBOSE="$VERBOSE"
+  export SSH_ROOT="${SSH}"
+  export SSH_AUTHORIZED_KEY
+  export CTID="$CT_ID"
+  export CTTYPE="$CT_TYPE"
+  export ENABLE_FUSE="$ENABLE_FUSE"
+  export ENABLE_TUN="$ENABLE_TUN"
+  export PCT_OSTYPE="$var_os"
+  export PCT_OSVERSION="$var_version"
+  export PCT_DISK_SIZE="$DISK_SIZE"
+  export PCT_OPTIONS="
+    -features $FEATURES
+    -hostname $HN
+    -tags $TAGS
+    $SD
+    $NS
+    $NET_STRING
+    -onboot 1
+    -cores $CORE_COUNT
+    -memory $RAM_SIZE
+    -unprivileged $CT_TYPE
+    $PW
+  "
+  
+  # Create LXC using standard process
+  bash -c "$(curl -fsSL https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/misc/create_lxc.sh)" $?
+
+  LXC_CONFIG="/etc/pve/lxc/${CTID}.conf"
+
+  # USB passthrough for privileged LXC (CT_TYPE=0)
+  if [ "$CT_TYPE" == "0" ]; then
+    cat <<EOF >>"$LXC_CONFIG"
+# USB passthrough
+lxc.cgroup2.devices.allow: a
+lxc.cap.drop:
+lxc.cgroup2.devices.allow: c 188:* rwm
+lxc.cgroup2.devices.allow: c 189:* rwm
+lxc.mount.entry: /dev/serial/by-id  dev/serial/by-id  none bind,optional,create=dir
+lxc.mount.entry: /dev/ttyUSB0       dev/ttyUSB0       none bind,optional,create=file
+lxc.mount.entry: /dev/ttyUSB1       dev/ttyUSB1       none bind,optional,create=file
+lxc.mount.entry: /dev/ttyACM0       dev/ttyACM0       none bind,optional,create=file
+lxc.mount.entry: /dev/ttyACM1       dev/ttyACM1       none bind,optional,create=file
+EOF
+  fi
+
+  # TUN device passthrough
+  if [ "$ENABLE_TUN" == "yes" ]; then
+    cat <<EOF >>"$LXC_CONFIG"
+lxc.cgroup2.devices.allow: c 10:200 rwm
+lxc.mount.entry: /dev/net/tun dev/net/tun none bind,create=file
+EOF
+  fi
+
+  # Start the container
+  msg_info "Starting LXC Container"
+  pct start "$CTID"
+
+  # Wait for container to be running
+  for i in {1..10}; do
+    if pct status "$CTID" | grep -q "status: running"; then
+      msg_ok "Started LXC Container"
+      break
+    fi
+    sleep 1
+    if [ "$i" -eq 10 ]; then
+      msg_error "LXC Container did not reach running state"
+      exit 1
+    fi
+  done
+
+  if [ "$var_os" != "alpine" ]; then
+    msg_info "Waiting for network in LXC container"
+    for i in {1..10}; do
+      if pct exec "$CTID" -- ping -c1 -W1 deb.debian.org >/dev/null 2>&1; then
+        msg_ok "Network in LXC is reachable (ping)"
+        break
+      fi
+      if [ "$i" -lt 10 ]; then
+        msg_warn "No network in LXC yet (try $i/10) – waiting..."
+        sleep 3
+      else
+        msg_warn "Ping failed 10 times. Trying HTTP connectivity check (wget) as fallback..."
+        if pct exec "$CTID" -- wget -q --spider http://deb.debian.org; then
+          msg_ok "Network in LXC is reachable (wget fallback)"
+        else
+          msg_error "No network in LXC after all checks."
+          exit 1
+        fi
+        break
+      fi
+    done
+  fi
+
+  msg_info "Customizing LXC Container"
+  : "${tz:=Etc/UTC}"
+  if [ "$var_os" == "alpine" ]; then
+    sleep 3
+    pct exec "$CTID" -- /bin/sh -c 'cat <<EOF >/etc/apk/repositories
+http://dl-cdn.alpinelinux.org/alpine/latest-stable/main
+http://dl-cdn.alpinelinux.org/alpine/latest-stable/community
+EOF'
+    pct exec "$CTID" -- ash -c "apk add bash newt curl openssh nano mc ncurses jq >/dev/null"
+  else
+    sleep 3
+    pct exec "$CTID" -- bash -c "sed -i '/$LANG/ s/^# //' /etc/locale.gen"
+    pct exec "$CTID" -- bash -c "locale_line=\$(grep -v '^#' /etc/locale.gen | grep -E '^[a-zA-Z]' | awk '{print \$1}' | head -n 1) && \
+    echo LANG=\$locale_line >/etc/default/locale && \
+    locale-gen >/dev/null && \
+    export LANG=\$locale_line"
+
+    if [[ -z "${tz:-}" ]]; then
+      tz=$(timedatectl show --property=Timezone --value 2>/dev/null || echo "Etc/UTC")
+    fi
+    if pct exec "$CTID" -- test -e "/usr/share/zoneinfo/$tz"; then
+      pct exec "$CTID" -- bash -c "tz='$tz'; echo \"\$tz\" >/etc/timezone && ln -sf \"/usr/share/zoneinfo/\$tz\" /etc/localtime"
+    else
+      msg_warn "Skipping timezone setup – zone '$tz' not found in container"
+    fi
+
+    pct exec "$CTID" -- bash -c "apt-get update >/dev/null && apt-get install -y sudo curl mc gnupg2 jq >/dev/null"
+  fi
+  msg_ok "Customized LXC Container"
+
+  # Run our custom install script
+  lxc-attach -n "$CTID" -- bash -c "$(curl -fsSL https://raw.githubusercontent.com/toxykdude/proxmox/refs/heads/main/ProxmoxVE/install/supabase-install.sh)"
+}
 
 # App Output & Base Settings
 header_info
-echo -e "${GN}${APP} LXC${CL}"
-echo -e "${BL}[INFO]${GN} This script will create a new ${APP} LXC Container${CL}"
-echo -e "${BL}[INFO]${YW} Container will be configured with Docker and all Supabase services${CL}"
+echo -e "\e[1;33m${APP} LXC\e[0m"
+echo -e "\e[0;34m[INFO]\e[1;32m This script will create a new ${APP} LXC Container\e[0m"
+echo -e "\e[0;34m[INFO]\e[1;33m Container will be configured with Docker and all Supabase services\e[0m"
 
-# Use this function to set variables in the container
-variables
-color
-catch_errors
-
-# Use this function to install the app (runs in the container)
-function install_app() {
-    msg_info "Installing Dependencies"
-    $STD apt-get update
-    $STD apt-get install -y \
-        curl \
-        wget \
-        git \
-        nano \
-        htop \
-        net-tools \
-        ca-certificates \
-        gnupg \
-        lsb-release \
-        ufw \
-        software-properties-common \
-        apt-transport-https
-    msg_ok "Installed Dependencies"
-
-    msg_info "Installing Docker"
-    # Add Docker's official GPG key
-    $STD mkdir -m 0755 -p /etc/apt/keyrings
-    $STD curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
-    $STD chmod a+r /etc/apt/keyrings/docker.asc
-
-    # Add Docker repository
-    echo \
-      "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu \
-      $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
-      tee /etc/apt/sources.list.d/docker.list > /dev/null
-
-    $STD apt-get update
-    $STD apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-
-    # Start and enable Docker
-    systemctl start docker
-    systemctl enable docker
-    msg_ok "Installed Docker"
-
-    msg_info "Creating Supabase User"
-    # Create dedicated user for Supabase
-    useradd -m -s /bin/bash -G docker supabase
-    echo "supabase:$(openssl rand -base64 32)" | chpasswd
-
-    # Set up sudo access
-    echo "supabase ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/supabase
-    msg_ok "Created Supabase User"
-
-    msg_info "Installing Node.js and Supabase CLI"
-    # Install Node.js 20.x
-    $STD curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
-    $STD apt-get install -y nodejs
-
-    # Install Supabase CLI
-    $STD npm install -g supabase@latest
-    msg_ok "Installed Node.js and Supabase CLI"
-
-    msg_info "Setting up Supabase Project"
-    # Create project directory
-    sudo -u supabase mkdir -p /home/supabase/supabase-project
-    cd /home/supabase/supabase-project
-
-    # Initialize Supabase project as supabase user
-    sudo -u supabase supabase init --workdir /home/supabase/supabase-project
-
-    # Generate secure secrets
-    POSTGRES_PASSWORD=$(openssl rand -base64 32)
-    JWT_SECRET=$(openssl rand -base64 64)
-    ANON_KEY=$(openssl rand -base64 32)
-    SERVICE_ROLE_KEY=$(openssl rand -base64 32)
-
-    # Create environment file
-    sudo -u supabase cat <<EOF > /home/supabase/supabase-project/.env
-POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
-JWT_SECRET=${JWT_SECRET}
-ANON_KEY=${ANON_KEY}
-SERVICE_ROLE_KEY=${SERVICE_ROLE_KEY}
-EOF
-
-    # Set proper permissions
-    chown -R supabase:supabase /home/supabase/supabase-project
-    chmod 600 /home/supabase/supabase-project/.env
-    msg_ok "Set up Supabase Project"
-
-    msg_info "Configuring Supabase Services"
-    # Get container IP for configuration
-    CONTAINER_IP=$(hostname -I | awk '{print $1}')
-    
-    # Update Supabase config for network access
-    sudo -u supabase cat <<EOF > /home/supabase/supabase-project/supabase/config.toml
-# A string used to distinguish different Supabase projects on the same host.
-project_id = "supabase-project"
-
-[api]
-enabled = true
-port = 54321
-schemas = ["public", "graphql_public"]
-extra_search_path = ["public", "extensions"]
-max_rows = 1000
-
-[db]
-port = 54322
-shadow_port = 54320
-major_version = 15
-
-[studio]
-enabled = true
-port = 3000
-api_url = "http://0.0.0.0:54321"
-
-[inbucket]
-enabled = true
-port = 54324
-api_port = 54323
-smtp_port = 54325
-
-[storage]
-enabled = true
-file_size_limit = "50MiB"
-buckets = []
-
-[auth]
-enabled = true
-site_url = "http://${CONTAINER_IP}:3000"
-additional_redirect_urls = ["http://${CONTAINER_IP}:3000", "http://localhost:3000"]
-jwt_expiry = 3600
-enable_signup = true
-enable_email_confirmations = false
-enable_sms_confirmations = false
-enable_phone_signup = false
-
-[edge_functions]
-enabled = true
-inspector_port = 8083
-
-[analytics]
-enabled = false
-EOF
-
-    # Set ownership
-    chown supabase:supabase /home/supabase/supabase-project/supabase/config.toml
-    msg_ok "Configured Supabase Services"
-
-    msg_info "Creating Management Scripts"
-    # Create management scripts
-    sudo -u supabase cat <<'EOF' > /home/supabase/manage-supabase.sh
-#!/bin/bash
-# Supabase Management Script
-
-CONTAINER_IP=$(hostname -I | awk '{print $1}')
-
-case "$1" in
-    start)
-        echo "Starting Supabase..."
-        cd /home/supabase/supabase-project && supabase start
-        ;;
-    stop)
-        echo "Stopping Supabase..."
-        cd /home/supabase/supabase-project && supabase stop
-        ;;
-    restart)
-        echo "Restarting Supabase..."
-        cd /home/supabase/supabase-project && supabase stop && supabase start
-        ;;
-    status)
-        echo "Supabase Status:"
-        cd /home/supabase/supabase-project && supabase status
-        ;;
-    logs)
-        echo "Supabase Logs:"
-        docker logs supabase_studio_supabase-project 2>/dev/null || echo "Studio logs not available"
-        docker logs supabase_db_supabase-project 2>/dev/null || echo "Database logs not available"
-        ;;
-    backup)
-        echo "Creating backup..."
-        BACKUP_FILE="/home/supabase/backups/supabase_backup_$(date +%Y%m%d_%H%M%S).sql"
-        mkdir -p /home/supabase/backups
-        docker exec supabase_db_supabase-project pg_dump -U postgres postgres > "$BACKUP_FILE"
-        echo "Backup created: $BACKUP_FILE"
-        ;;
-    info)
-        echo "=== Supabase Information ==="
-        echo "Studio URL: http://${CONTAINER_IP}:3000"
-        echo "API URL: http://${CONTAINER_IP}:54321"
-        echo "Database URL: postgresql://postgres:postgres@${CONTAINER_IP}:54322/postgres"
-        echo ""
-        echo "Environment file: /home/supabase/supabase-project/.env"
-        echo "Config file: /home/supabase/supabase-project/supabase/config.toml"
-        echo ""
-        cd /home/supabase/supabase-project && supabase status 2>/dev/null || echo "Supabase is not running"
-        ;;
-    *)
-        echo "Usage: $0 {start|stop|restart|status|logs|backup|info}"
-        exit 1
-        ;;
-esac
-EOF
-
-    chmod +x /home/supabase/manage-supabase.sh
-    chown supabase:supabase /home/supabase/manage-supabase.sh
-
-    # Create root symlink for easy access
-    ln -sf /home/supabase/manage-supabase.sh /usr/local/bin/supabase-manage
-    msg_ok "Created Management Scripts"
-
-    msg_info "Setting up Backup Cron Job"
-    # Set up automated daily backup
-    sudo -u supabase mkdir -p /home/supabase/backups
-    sudo -u supabase cat <<'EOF' > /home/supabase/backup-cron.sh
-#!/bin/bash
-cd /home/supabase/supabase-project
-docker exec supabase_db_supabase-project pg_dump -U postgres postgres > /home/supabase/backups/supabase_backup_$(date +%Y%m%d_%H%M%S).sql
-# Keep only last 7 backups
-find /home/supabase/backups -name "supabase_backup_*.sql" -type f -mtime +7 -delete
-EOF
-
-    chmod +x /home/supabase/backup-cron.sh
-    chown supabase:supabase /home/supabase/backup-cron.sh
-
-    # Add cron job (daily at 2 AM)
-    (sudo -u supabase crontab -l 2>/dev/null; echo "0 2 * * * /home/supabase/backup-cron.sh") | sudo -u supabase crontab -
-    msg_ok "Set up Backup Cron Job"
-
-    msg_info "Configuring Firewall"
-    # Configure UFW firewall
-    ufw --force enable
-
-    # Allow SSH
-    ufw allow 22/tcp
-
-    # Allow Supabase services
-    ufw allow 3000/tcp     # Studio
-    ufw allow 54321/tcp    # API
-    ufw allow 54322/tcp    # Database
-    ufw allow 54323/tcp    # Auth
-    ufw allow 54324/tcp    # Realtime/Inbucket
-    ufw allow 54325/tcp    # Storage/SMTP
-
-    msg_ok "Configured Firewall"
-
-    msg_info "Starting Supabase Services"
-    # Start Supabase (this will download Docker images)
-    cd /home/supabase/supabase-project
-    
-    # Pre-pull images to speed up first start
-    sudo -u supabase docker pull supabase/postgres:15.1.0.147
-    sudo -u supabase docker pull postgrest/postgrest:v12.0.1
-    sudo -u supabase docker pull supabase/gotrue:v2.132.3
-    sudo -u supabase docker pull supabase/realtime:v2.25.50
-    sudo -u supabase docker pull supabase/storage-api:v0.46.4
-    sudo -u supabase docker pull supabase/studio:20240422-5cf8f30
-
-    # Start Supabase services
-    sudo -u supabase supabase start
-
-    msg_ok "Started Supabase Services"
-
-    msg_info "Creating Systemd Service"
-    # Create systemd service for Supabase
-    cat <<EOF > /etc/systemd/system/supabase.service
-[Unit]
-Description=Supabase Local Development
-After=docker.service
-Requires=docker.service
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-User=supabase
-Group=supabase
-WorkingDirectory=/home/supabase/supabase-project
-Environment=PATH=/usr/local/bin:/usr/bin:/bin
-ExecStart=/bin/bash -c 'supabase start'
-ExecStop=/bin/bash -c 'supabase stop'
-ExecReload=/bin/bash -c 'supabase stop && supabase start'
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    systemctl daemon-reload
-    systemctl enable supabase.service
-    msg_ok "Created Systemd Service"
-
-    # Get final container IP and connection info
-    CONTAINER_IP=$(hostname -I | awk '{print $1}')
-    
-    # Create welcome message
-    cat <<EOF > /etc/motd
-
-=== Supabase Container ===
-Container IP: ${CONTAINER_IP}
-
-🌐 Web Interfaces:
-Studio: http://${CONTAINER_IP}:3000
-API: http://${CONTAINER_IP}:54321
-
-📊 Database:
-URL: postgresql://postgres:postgres@${CONTAINER_IP}:54322/postgres
-
-🔧 Management Commands:
-supabase-manage start    - Start Supabase
-supabase-manage stop     - Stop Supabase  
-supabase-manage restart  - Restart Supabase
-supabase-manage status   - Show status
-supabase-manage logs     - View logs
-supabase-manage backup   - Create backup
-supabase-manage info     - Show connection info
-
-📁 Important Files:
-Environment: /home/supabase/supabase-project/.env
-Config: /home/supabase/supabase-project/supabase/config.toml
-Backups: /home/supabase/backups/
-
-For more information: https://supabase.com/docs
-
-EOF
-
-    msg_info "Customizing Container"
-    # Create app data path  
-    mkdir -p /opt/supabase
-    echo "${CONTAINER_IP}" > /opt/supabase/container_ip
-    echo "Supabase configured successfully!" > /opt/supabase/install.log
-    msg_ok "Customized Container"
-}
-
-# This starts the builds script
+# This starts the build script
 start
