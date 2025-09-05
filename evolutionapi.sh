@@ -1,104 +1,62 @@
 #!/usr/bin/env bash
 # ----------------------------------------------------------------------------------
 # Evolution API LXC Installer for Proxmox VE
-# Inspired by: https://github.com/community-scripts/ProxmoxVE
+# Based on: https://github.com/community-scripts/ProxmoxVE
 # Author: toxykdude
 # ----------------------------------------------------------------------------------
 
 set -euo pipefail
 IFS=$'\n\t'
 
+# Load build functions
+source <(curl -fsSL https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/misc/build.func)
+
+# App details
 APP="Evolution API"
-CTID=${CTID:-900}
-HOSTNAME="evolutionapi"
-DISK_SIZE="8G"
-RAM_SIZE="1024"
-BRIDGE="vmbr0"
-NET="dhcp"
+var_os="debian"
+var_version="12"
+var_tag="standard"
+var_ctid="900"
+var_cpu="2"
+var_ram="1024"
+var_disk="8"
+var_storage="local-lvm"
+var_net="dhcp"
+var_bridge="vmbr0"
+description="WhatsApp Evolution API server with Node.js + PM2"
 
-YW=$'\033[33m'
-RD=$'\033[01;31m'
-GR=$'\033[1;92m'
-BL=$'\033[36m'
-CL=$'\033[m'
+header_info
+echo -e "${BL}Starting build for: ${APP}${CL}"
 
-# Error handler
-error_exit() {
-  echo -e "${RD}Error: $1${CL}"
-  exit 1
-}
+# Build container
+build_container
 
-# Header
-clear
-echo -e "${GR}
--------------------------------------------------
-   ${APP} LXC Installer for Proxmox VE
--------------------------------------------------
-${CL}"
-
-# Check root
-if [[ $EUID -ne 0 ]]; then
-  error_exit "This script must be run as root."
-fi
-
-# Find latest Debian 12 template
-echo -e "${BL}Checking container template...${CL}"
-LATEST_DEBIAN=$(pveam available | grep debian-12-standard | sort -V | tail -n1 | awk '{print $2}')
-
-if [[ -z "$LATEST_DEBIAN" ]]; then
-  error_exit "No Debian 12 template found in pveam available list."
-fi
-
-# Download if missing
-if ! pveam list local | grep -q "${LATEST_DEBIAN##*/}"; then
-  echo -e "${BL}Downloading Debian template: ${LATEST_DEBIAN}${CL}"
-  pveam download local "$LATEST_DEBIAN" || error_exit "Template download failed"
-fi
-
-# Template reference for pct
-TEMPLATE="local:vztmpl/${LATEST_DEBIAN##*/}"
-
-# Create LXC container
-echo -e "${BL}Creating LXC container (CTID: ${CTID})...${CL}"
-pct create $CTID $TEMPLATE \
-  --hostname $HOSTNAME \
-  --rootfs local-lvm:${DISK_SIZE} \
-  --memory $RAM_SIZE \
-  --net0 name=eth0,bridge=$BRIDGE,ip=${NET} \
-  --unprivileged 1 \
-  --features nesting=1 || error_exit "LXC creation failed"
-
-# Start container
-echo -e "${BL}Starting container...${CL}"
-pct start $CTID
-sleep 5
-
-# Install Evolution API inside LXC
-echo -e "${BL}Installing ${APP} inside container...${CL}"
-pct exec $CTID -- bash -c "
-  set -e
+# Post-install inside container
+post_install() {
+  echo -e "${BL}Installing ${APP} inside container...${CL}"
   apt-get update
   apt-get install -y curl git build-essential
   curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
   apt-get install -y nodejs
   npm install -g pm2
+
   cd /opt
   git clone https://github.com/EvolutionAPI/evolution-api evolutionapi
   cd evolutionapi
   npm install
+
   pm2 start src/index.js --name evolutionapi
   pm2 startup systemd -u root --hp /root
   pm2 save
-"
+}
+
+# Push post-install function into container
+pct exec "$CTID" -- bash -c "$(declare -f post_install); post_install"
 
 # Success message
-IP=$(pct exec $CTID -- hostname -I | awk '{print $1}')
-echo -e "${GR}
--------------------------------------------------
-   ${APP} installation completed successfully!
-   Container ID: ${CTID}
-   Hostname:     ${HOSTNAME}
-   IP Address:   ${IP}
-   Service:      running via pm2
--------------------------------------------------
-${CL}"
+IP=$(pct exec "$CTID" -- hostname -I | awk '{print $1}')
+msg_ok "Installation of ${APP} completed"
+msg_info "Container ID: $CTID"
+msg_info "Hostname: $HN"
+msg_info "IP Address: $IP"
+msg_info "Service: running via pm2"
