@@ -9,7 +9,6 @@ set -euo pipefail
 IFS=$'\n\t'
 
 APP="Evolution API"
-VAR_LIB_CT="/var/lib/vz/template/cache"
 CTID=${CTID:-900}
 HOSTNAME="evolutionapi"
 DISK_SIZE="8G"
@@ -50,16 +49,18 @@ if [[ -z "$LATEST_DEBIAN" ]]; then
   error_exit "No Debian 12 template found in pveam available list."
 fi
 
-TEMPLATE_FILE="${VAR_LIB_CT}/${LATEST_DEBIAN##*/}"
-
-if [[ ! -f "$TEMPLATE_FILE" ]]; then
+# Download if missing
+if ! pveam list local | grep -q "${LATEST_DEBIAN##*/}"; then
   echo -e "${BL}Downloading Debian template: ${LATEST_DEBIAN}${CL}"
   pveam download local "$LATEST_DEBIAN" || error_exit "Template download failed"
 fi
 
+# Template reference for pct
+TEMPLATE="local:vztmpl/${LATEST_DEBIAN##*/}"
+
 # Create LXC container
 echo -e "${BL}Creating LXC container (CTID: ${CTID})...${CL}"
-pct create $CTID "$TEMPLATE_FILE" \
+pct create $CTID $TEMPLATE \
   --hostname $HOSTNAME \
   --rootfs local-lvm:${DISK_SIZE} \
   --memory $RAM_SIZE \
