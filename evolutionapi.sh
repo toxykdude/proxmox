@@ -16,7 +16,6 @@ DISK_SIZE="8G"
 RAM_SIZE="1024"
 BRIDGE="vmbr0"
 NET="dhcp"
-IMAGE="debian-12-standard_12.2-1_amd64.tar.zst"
 
 YW=$'\033[33m'
 RD=$'\033[01;31m'
@@ -43,17 +42,24 @@ if [[ $EUID -ne 0 ]]; then
   error_exit "This script must be run as root."
 fi
 
-# Ensure pveam template exists
+# Find latest Debian 12 template
 echo -e "${BL}Checking container template...${CL}"
-if [[ ! -f "${VAR_LIB_CT}/${IMAGE}" ]]; then
-  echo -e "${BL}Downloading Debian template...${CL}"
-  pveam update >/dev/null
-  pveam download local debian-12-standard_12.2-1_amd64.tar.zst || error_exit "Template download failed"
+LATEST_DEBIAN=$(pveam available | grep debian-12-standard | sort -V | tail -n1 | awk '{print $2}')
+
+if [[ -z "$LATEST_DEBIAN" ]]; then
+  error_exit "No Debian 12 template found in pveam available list."
+fi
+
+TEMPLATE_FILE="${VAR_LIB_CT}/${LATEST_DEBIAN##*/}"
+
+if [[ ! -f "$TEMPLATE_FILE" ]]; then
+  echo -e "${BL}Downloading Debian template: ${LATEST_DEBIAN}${CL}"
+  pveam download local "$LATEST_DEBIAN" || error_exit "Template download failed"
 fi
 
 # Create LXC container
 echo -e "${BL}Creating LXC container (CTID: ${CTID})...${CL}"
-pct create $CTID ${VAR_LIB_CT}/${IMAGE} \
+pct create $CTID "$TEMPLATE_FILE" \
   --hostname $HOSTNAME \
   --rootfs local-lvm:${DISK_SIZE} \
   --memory $RAM_SIZE \
@@ -80,7 +86,7 @@ pct exec $CTID -- bash -c "
   cd evolutionapi
   npm install
   pm2 start src/index.js --name evolutionapi
-  pm2 startup systemd
+  pm2 startup systemd -u root --hp /root
   pm2 save
 "
 
@@ -95,4 +101,3 @@ echo -e "${GR}
    Service:      running via pm2
 -------------------------------------------------
 ${CL}"
-
