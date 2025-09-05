@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 
 # Copyright (c) 2021-2025 community-scripts
-# Author: Based on tteck's template
+# Author: Based on tteck's template  
 # License: MIT | https://github.com/community-scripts/ProxmoxVE/raw/main/LICENSE
 # Source: https://supabase.com/
+# GitHub: https://github.com/toxykdude/proxmox
 
 source /dev/stdin <<<"$FUNCTIONS_FILE_PATH"
 color
