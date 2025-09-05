@@ -6,6 +6,14 @@
 # Source: https://supabase.com/
 # GitHub: https://github.com/toxykdude/proxmox
 
+# Colors for output
+RD='\033[01;31m'
+GN='\033[1;92m'
+BL='\033[36m'
+YW='\033[33m'
+CL='\033[0m'
+CM='\033[0;36m'
+
 function header_info {
 clear
 cat <<"EOF"
@@ -21,197 +29,125 @@ EOF
 
 # App Variable(s)
 APP="Supabase"
-var_cpu="2"
-var_ram="4096"
-var_disk="8"
-var_os="ubuntu"
-var_version="22.04"
-var_unprivileged="1"
-var_install="supabase"
+NSAPP="supabase"
 
-# Show user information
+# Check if running on Proxmox
+if ! command -v pveversion >/dev/null 2>&1; then
+    echo -e "${RD}This script must be run on a Proxmox VE host.${CL}"
+    exit 1
+fi
+
+# Check if running as root
+if [[ $EUID -ne 0 ]]; then
+   echo -e "${RD}This script must be run as root${CL}" 
+   exit 1
+fi
+
 header_info
-echo -e "Loading..."
+echo -e "${BL}[INFO]${GN} This script will create a new ${APP} LXC Container${CL}"
+echo -e "${BL}[INFO]${YW} Container will be configured with Docker and all Supabase services${CL}"
 
-# Import build functions with modifications for custom repository
-source <(curl -fsSL https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/misc/build.func)
+# Set default values
+CTID=$(pvesh get /cluster/nextid)
+CTNAME="supabase"
+DISK_SIZE="8"
+CORES="2"
+RAM="4096"
+BRIDGE="vmbr0"
+NET="dhcp"
+OSTYPE="ubuntu"
+OSVERSION="22.04"
+TEMPLATE="ubuntu-22.04-standard_22.04-1_amd64.tar.zst"
+STORAGE="local-lxc"
 
-# Override the build_container function to use our custom install script URL
-build_container() {
-  NET_STRING="-net0 name=eth0,bridge=$BRG$MAC,ip=$NET$GATE$VLAN$MTU"
-  case "$IPV6_METHOD" in
-  auto) NET_STRING="$NET_STRING,ip6=auto" ;;
-  dhcp) NET_STRING="$NET_STRING,ip6=dhcp" ;;
-  static)
-    NET_STRING="$NET_STRING,ip6=$IPV6_ADDR"
-    [ -n "$IPV6_GATE" ] && NET_STRING="$NET_STRING,gw6=$IPV6_GATE"
-    ;;
-  none) ;;
-  esac
-  if [ "$CT_TYPE" == "1" ]; then
-    FEATURES="keyctl=1,nesting=1"
-  else
-    FEATURES="nesting=1"
-  fi
+echo -e "\n${BL}Container Configuration:${CL}"
+echo -e "  ${CM}Container ID:${CL} ${CTID}"
+echo -e "  ${CM}Hostname:${CL} ${CTNAME}"
+echo -e "  ${CM}Disk Size:${CL} ${DISK_SIZE}GB"
+echo -e "  ${CM}Cores:${CL} ${CORES}"
+echo -e "  ${CM}RAM:${CL} ${RAM}MB"
+echo -e "  ${CM}Network:${CL} ${NET}"
+echo -e "  ${CM}OS:${CL} ${OSTYPE} ${OSVERSION}"
 
-  if [ "$ENABLE_FUSE" == "yes" ]; then
-    FEATURES="$FEATURES,fuse=1"
-  fi
+read -p "Press Enter to continue or Ctrl+C to cancel..."
 
-  if [[ $DIAGNOSTICS == "yes" ]]; then
-    post_to_api
-  fi
+echo -e "\n${GN}Downloading Ubuntu template if needed...${CL}"
+if ! pveam list $STORAGE | grep -q $TEMPLATE; then
+    pveam download $STORAGE $TEMPLATE
+fi
 
-  TEMP_DIR=$(mktemp -d)
-  pushd "$TEMP_DIR" >/dev/null
-  
-  # Use the standard install.func for most functionality
-  if [ "$var_os" == "alpine" ]; then
-    export FUNCTIONS_FILE_PATH="$(curl -fsSL https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/misc/alpine-install.func)"
-  else
-    export FUNCTIONS_FILE_PATH="$(curl -fsSL https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/misc/install.func)"
-  fi
+echo -e "${GN}Creating LXC container...${CL}"
+pct create $CTID $STORAGE:vztmpl/$TEMPLATE \
+  --arch amd64 \
+  --cores $CORES \
+  --hostname $CTNAME \
+  --memory $RAM \
+  --net0 name=eth0,bridge=$BRIDGE,ip=$NET \
+  --onboot 1 \
+  --ostype $OSTYPE \
+  --rootfs $STORAGE:$DISK_SIZE \
+  --swap 512 \
+  --unprivileged 1 \
+  --features keyctl=1,nesting=1
 
-  export DIAGNOSTICS="$DIAGNOSTICS"
-  export RANDOM_UUID="$RANDOM_UUID"
-  export CACHER="$APT_CACHER"
-  export CACHER_IP="$APT_CACHER_IP"
-  export tz="$timezone"
-  export APPLICATION="$APP"
-  export app="$NSAPP"
-  export PASSWORD="$PW"
-  export VERBOSE="$VERBOSE"
-  export SSH_ROOT="${SSH}"
-  export SSH_AUTHORIZED_KEY
-  export CTID="$CT_ID"
-  export CTTYPE="$CT_TYPE"
-  export ENABLE_FUSE="$ENABLE_FUSE"
-  export ENABLE_TUN="$ENABLE_TUN"
-  export PCT_OSTYPE="$var_os"
-  export PCT_OSVERSION="$var_version"
-  export PCT_DISK_SIZE="$DISK_SIZE"
-  export PCT_OPTIONS="
-    -features $FEATURES
-    -hostname $HN
-    -tags $TAGS
-    $SD
-    $NS
-    $NET_STRING
-    -onboot 1
-    -cores $CORE_COUNT
-    -memory $RAM_SIZE
-    -unprivileged $CT_TYPE
-    $PW
-  "
-  
-  # Create LXC using standard process
-  bash -c "$(curl -fsSL https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/misc/create_lxc.sh)" $?
+if [ $? -ne 0 ]; then
+    echo -e "${RD}Failed to create container${CL}"
+    exit 1
+fi
 
-  LXC_CONFIG="/etc/pve/lxc/${CTID}.conf"
+echo -e "${GN}Container created successfully!${CL}"
+echo -e "${GN}Starting container...${CL}"
 
-  # USB passthrough for privileged LXC (CT_TYPE=0)
-  if [ "$CT_TYPE" == "0" ]; then
-    cat <<EOF >>"$LXC_CONFIG"
-# USB passthrough
-lxc.cgroup2.devices.allow: a
-lxc.cap.drop:
-lxc.cgroup2.devices.allow: c 188:* rwm
-lxc.cgroup2.devices.allow: c 189:* rwm
-lxc.mount.entry: /dev/serial/by-id  dev/serial/by-id  none bind,optional,create=dir
-lxc.mount.entry: /dev/ttyUSB0       dev/ttyUSB0       none bind,optional,create=file
-lxc.mount.entry: /dev/ttyUSB1       dev/ttyUSB1       none bind,optional,create=file
-lxc.mount.entry: /dev/ttyACM0       dev/ttyACM0       none bind,optional,create=file
-lxc.mount.entry: /dev/ttyACM1       dev/ttyACM1       none bind,optional,create=file
-EOF
-  fi
+pct start $CTID
 
-  # TUN device passthrough
-  if [ "$ENABLE_TUN" == "yes" ]; then
-    cat <<EOF >>"$LXC_CONFIG"
-lxc.cgroup2.devices.allow: c 10:200 rwm
-lxc.mount.entry: /dev/net/tun dev/net/tun none bind,create=file
-EOF
-  fi
+# Wait for container to start
+echo -e "${GN}Waiting for container to fully start...${CL}"
+sleep 10
 
-  # Start the container
-  msg_info "Starting LXC Container"
-  pct start "$CTID"
-
-  # Wait for container to be running
-  for i in {1..10}; do
-    if pct status "$CTID" | grep -q "status: running"; then
-      msg_ok "Started LXC Container"
-      break
-    fi
-    sleep 1
-    if [ "$i" -eq 10 ]; then
-      msg_error "LXC Container did not reach running state"
-      exit 1
-    fi
-  done
-
-  if [ "$var_os" != "alpine" ]; then
-    msg_info "Waiting for network in LXC container"
-    for i in {1..10}; do
-      if pct exec "$CTID" -- ping -c1 -W1 deb.debian.org >/dev/null 2>&1; then
-        msg_ok "Network in LXC is reachable (ping)"
+# Wait for network
+echo -e "${GN}Waiting for network connectivity...${CL}"
+for i in {1..30}; do
+    if pct exec $CTID -- ping -c1 -W2 8.8.8.8 >/dev/null 2>&1; then
+        echo -e "${GN}Network is ready${CL}"
         break
-      fi
-      if [ "$i" -lt 10 ]; then
-        msg_warn "No network in LXC yet (try $i/10) – waiting..."
-        sleep 3
-      else
-        msg_warn "Ping failed 10 times. Trying HTTP connectivity check (wget) as fallback..."
-        if pct exec "$CTID" -- wget -q --spider http://deb.debian.org; then
-          msg_ok "Network in LXC is reachable (wget fallback)"
-        else
-          msg_error "No network in LXC after all checks."
-          exit 1
-        fi
+    fi
+    if [ $i -eq 30 ]; then
+        echo -e "${RD}Network timeout - but continuing anyway${CL}"
         break
-      fi
-    done
-  fi
-
-  msg_info "Customizing LXC Container"
-  : "${tz:=Etc/UTC}"
-  if [ "$var_os" == "alpine" ]; then
-    sleep 3
-    pct exec "$CTID" -- /bin/sh -c 'cat <<EOF >/etc/apk/repositories
-http://dl-cdn.alpinelinux.org/alpine/latest-stable/main
-http://dl-cdn.alpinelinux.org/alpine/latest-stable/community
-EOF'
-    pct exec "$CTID" -- ash -c "apk add bash newt curl openssh nano mc ncurses jq >/dev/null"
-  else
-    sleep 3
-    pct exec "$CTID" -- bash -c "sed -i '/$LANG/ s/^# //' /etc/locale.gen"
-    pct exec "$CTID" -- bash -c "locale_line=\$(grep -v '^#' /etc/locale.gen | grep -E '^[a-zA-Z]' | awk '{print \$1}' | head -n 1) && \
-    echo LANG=\$locale_line >/etc/default/locale && \
-    locale-gen >/dev/null && \
-    export LANG=\$locale_line"
-
-    if [[ -z "${tz:-}" ]]; then
-      tz=$(timedatectl show --property=Timezone --value 2>/dev/null || echo "Etc/UTC")
     fi
-    if pct exec "$CTID" -- test -e "/usr/share/zoneinfo/$tz"; then
-      pct exec "$CTID" -- bash -c "tz='$tz'; echo \"\$tz\" >/etc/timezone && ln -sf \"/usr/share/zoneinfo/\$tz\" /etc/localtime"
-    else
-      msg_warn "Skipping timezone setup – zone '$tz' not found in container"
-    fi
+    sleep 2
+done
 
-    pct exec "$CTID" -- bash -c "apt-get update >/dev/null && apt-get install -y sudo curl mc gnupg2 jq >/dev/null"
-  fi
-  msg_ok "Customized LXC Container"
+echo -e "${GN}Installing Supabase...${CL}"
+echo -e "${YW}This may take 10-15 minutes. Please be patient...${CL}"
 
-  # Run our custom install script
-  lxc-attach -n "$CTID" -- bash -c "$(curl -fsSL https://raw.githubusercontent.com/toxykdude/proxmox/refs/heads/main/ProxmoxVE/install/supabase-install.sh)"
-}
+# Execute the install script inside the container
+pct exec $CTID -- bash -c "$(curl -fsSL https://raw.githubusercontent.com/toxykdude/proxmox/refs/heads/main/ProxmoxVE/install/supabase-install.sh)" 2>&1
 
-# App Output & Base Settings
-header_info
-echo -e "\e[1;33m${APP} LXC\e[0m"
-echo -e "\e[0;34m[INFO]\e[1;32m This script will create a new ${APP} LXC Container\e[0m"
-echo -e "\e[0;34m[INFO]\e[1;33m Container will be configured with Docker and all Supabase services\e[0m"
-
-# This starts the build script
-start
+if [ $? -eq 0 ]; then
+    echo -e "\n${GN}✅ Supabase installation completed successfully!${CL}"
+    
+    # Get container IP
+    CONTAINER_IP=$(pct exec $CTID -- hostname -I | awk '{print $1}')
+    
+    echo -e "\n${BL}🌐 Access Information:${CL}"
+    echo -e "  ${CM}Studio URL:${CL} http://${CONTAINER_IP}:3000"
+    echo -e "  ${CM}API URL:${CL} http://${CONTAINER_IP}:54321"
+    echo -e "  ${CM}Database:${CL} postgresql://postgres:postgres@${CONTAINER_IP}:54322/postgres"
+    
+    echo -e "\n${BL}🔧 Management Commands:${CL}"
+    echo -e "  ${CM}Enter container:${CL} pct enter ${CTID}"
+    echo -e "  ${CM}Start Supabase:${CL} pct exec ${CTID} -- supabase-manage start"
+    echo -e "  ${CM}Stop Supabase:${CL} pct exec ${CTID} -- supabase-manage stop"
+    echo -e "  ${CM}Check status:${CL} pct exec ${CTID} -- supabase-manage status"
+    echo -e "  ${CM}Get info:${CL} pct exec ${CTID} -- supabase-manage info"
+    
+    echo -e "\n${GN}🎉 Setup complete! You can now access Supabase Studio at: http://${CONTAINER_IP}:3000${CL}"
+else
+    echo -e "\n${RD}❌ Installation failed. Check the logs above for details.${CL}"
+    echo -e "${YW}Container ${CTID} was created but Supabase installation failed.${CL}"
+    echo -e "${YW}You can try running the installation manually:${CL}"
+    echo -e "  pct enter ${CTID}"
+    echo -e "  curl -fsSL https://raw.githubusercontent.com/toxykdude/proxmox/refs/heads/main/ProxmoxVE/install/supabase-install.sh | bash"
+    exit 1
+fi
