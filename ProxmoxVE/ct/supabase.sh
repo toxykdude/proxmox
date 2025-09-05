@@ -4,6 +4,7 @@
 # Author: Based on tteck's community-scripts template
 # License: MIT
 # Source: https://supabase.com/
+# GitHub: https://github.com/toxykdude/proxmox
 
 source <(curl -fsSL https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/misc/build.func)
 
