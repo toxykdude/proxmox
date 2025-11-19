@@ -215,6 +215,90 @@ fi
 echo -e "${GREEN}✓ docker-compose.yml encontrado${NC}"
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Crear docker-compose modificado para evitar errores de sysctls
+# ─────────────────────────────────────────────────────────────────────────────
+create_fixed_compose() {
+    echo "Creando configuración de Docker Compose optimizada..."
+    
+    # Crear backup si no existe
+    if [[ ! -f "$SCRIPT_DIR/docker-compose.yml.original" ]]; then
+        cp "$SCRIPT_DIR/docker-compose.yml" "$SCRIPT_DIR/docker-compose.yml.original"
+        echo "  - Backup creado: docker-compose.yml.original"
+    fi
+    
+    # Crear versión modificada con cap_add y privileged para evolution_api
+    cat > "$SCRIPT_DIR/docker-compose.yml" <<'EOF'
+services:
+  evolution_api:
+    container_name: evolution_api
+    image: atendai/evolution-api:latest
+    restart: always
+    depends_on:
+      - redis
+      - postgres
+    ports:
+      - ${EVOLUTION_API_PORT}:8080
+    volumes:
+      - evolution_instances:/evolution/instances
+    networks:
+      - evolution-net
+    env_file:
+      - .env
+    expose:
+      - 8080
+    cap_add:
+      - NET_ADMIN
+      - SYS_ADMIN
+    security_opt:
+      - apparmor=unconfined
+    privileged: true
+  redis:
+    image: redis:latest
+    restart: always
+    networks:
+      - evolution-net
+    container_name: redis
+    command: >
+      redis-server --port 6379 --appendonly yes
+    volumes:
+      - evolution_redis:/data
+    ports:
+      - ${REDIS_PORT}:6379
+  postgres:
+    container_name: postgres
+    image: postgres:15
+    networks:
+      - evolution-net
+    command:
+      ["postgres", "-c", "max_connections=1000", "-c", "listen_addresses=*"]
+    restart: always
+    ports:
+      - ${POSTGRESS_PORT}:5432
+    environment:
+      - POSTGRES_USER=${POSTGRESS_USER}
+      - POSTGRES_PASSWORD=${POSTGRESS_PASS}
+      - POSTGRES_DB=evolution
+      - POSTGRES_HOST_AUTH_METHOD=trust
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    expose:
+      - 5432
+volumes:
+  evolution_instances:
+  evolution_redis:
+  postgres_data:
+networks:
+  evolution-net:
+    name: evolution-net
+    driver: bridge
+EOF
+    
+    echo -e "${GREEN}✓ Docker Compose configurado con permisos necesarios${NC}"
+}
+
+create_fixed_compose
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Detener y limpiar contenedores existentes en caso de error previo
 # ─────────────────────────────────────────────────────────────────────────────
 cleanup_failed_containers() {
@@ -266,51 +350,30 @@ else
     echo "Esto puede tardar algunos minutos mientras se descargan las imágenes..."
     echo ""
     
-    # Intentar iniciar con docker compose y capturar errores
-    if sudo docker compose -f "$SCRIPT_DIR/docker-compose.yml" up -d 2>&1 | tee /tmp/docker-compose-output.log; then
-        # Verificar que no haya errores en el output
-        if grep -qi "error\|failed" /tmp/docker-compose-output.log; then
-            ERROR_OUTPUT=$(cat /tmp/docker-compose-output.log)
-            
-            if echo "$ERROR_OUTPUT" | grep -q "permission denied"; then
-                echo -e "\n${YELLOW}⚠ Error de permisos detectado. Aplicando solución...${NC}"
-                
-                # Deshabilitar temporalmente AppArmor para Docker
-                if command -v aa-status >/dev/null 2>&1; then
-                    echo "  - Deshabilitando restricciones de AppArmor..."
-                    sudo systemctl stop apparmor 2>/dev/null || true
-                    sudo systemctl disable apparmor 2>/dev/null || true
-                fi
-                
-                # Limpiar e intentar nuevamente
-                echo "  - Limpiando y reiniciando Docker..."
-                cleanup_failed_containers
-                sudo systemctl restart docker
-                sleep 5
-                
-                echo "  - Reintentando inicio de servicios..."
-                if sudo docker compose -f "$SCRIPT_DIR/docker-compose.yml" up -d; then
-                    echo -e "${GREEN}✓ Servicios iniciados correctamente${NC}"
-                else
-                    echo -e "${RED}✗ Error persistente. Verifica los logs manualmente.${NC}"
-                    exit 1
-                fi
-            else
-                echo -e "${RED}✗ Error desconocido al iniciar servicios.${NC}"
-                cat /tmp/docker-compose-output.log
-                exit 1
-            fi
-        else
-            echo -e "${GREEN}✓ Servicios iniciados correctamente${NC}"
-        fi
+    # Pull de las imágenes primero para mejor diagnóstico
+    echo "Descargando imágenes de Docker..."
+    sudo docker compose -f "$SCRIPT_DIR/docker-compose.yml" pull
+    
+    echo ""
+    echo "Iniciando contenedores..."
+    
+    # Intentar iniciar con docker compose
+    if sudo docker compose -f "$SCRIPT_DIR/docker-compose.yml" up -d; then
+        echo -e "${GREEN}✓ Servicios iniciados correctamente${NC}"
     else
-        echo -e "${RED}✗ Error al ejecutar docker compose.${NC}"
-        cat /tmp/docker-compose-output.log
+        echo -e "${RED}✗ Error al iniciar servicios${NC}"
+        echo ""
+        echo "Mostrando logs de los contenedores:"
+        sudo docker compose -f "$SCRIPT_DIR/docker-compose.yml" logs --tail=50
+        echo ""
+        echo -e "${YELLOW}Intentando diagnóstico adicional...${NC}"
+        
+        # Verificar estado de contenedores
+        echo "Estado de contenedores:"
+        sudo docker ps -a | grep -E "(evolution|redis|postgres|CONTAINER)"
+        
         exit 1
     fi
-    
-    # Limpiar archivo temporal
-    rm -f /tmp/docker-compose-output.log
 fi
 
 CHECK_APP_MAX_ATTEMPTS=12
