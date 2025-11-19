@@ -90,6 +90,71 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Configurar Docker en modo legacy para evitar problemas con sysctls
+# ─────────────────────────────────────────────────────────────────────────────
+configure_docker_legacy_mode() {
+    echo "Configurando Docker para compatibilidad con sysctls..."
+    
+    # Crear o modificar daemon.json
+    DAEMON_JSON="/etc/docker/daemon.json"
+    
+    if [ -f "$DAEMON_JSON" ]; then
+        echo "  - Haciendo backup de daemon.json existente..."
+        sudo cp "$DAEMON_JSON" "${DAEMON_JSON}.backup.$(date +%Y%m%d_%H%M%S)"
+    fi
+    
+    # Configuración que soluciona el problema de sysctls
+    echo "  - Creando nueva configuración de Docker..."
+    sudo tee "$DAEMON_JSON" > /dev/null <<EOF
+{
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "10m",
+    "max-file": "3"
+  },
+  "default-runtime": "runc",
+  "runtimes": {
+    "runc": {
+      "path": "runc"
+    }
+  },
+  "features": {
+    "buildkit": true
+  }
+}
+EOF
+    
+    echo -e "${GREEN}  ✓ Configuración de Docker actualizada${NC}"
+    
+    # Configurar containerd
+    echo "  - Configurando containerd..."
+    sudo mkdir -p /etc/containerd
+    
+    # Generar configuración por defecto si no existe
+    if [ ! -f /etc/containerd/config.toml ]; then
+        sudo containerd config default | sudo tee /etc/containerd/config.toml > /dev/null
+    fi
+    
+    # Modificar la configuración de containerd para usar runc con privilegios correctos
+    if ! grep -q "SystemdCgroup = true" /etc/containerd/config.toml; then
+        echo "  - Habilitando SystemdCgroup en containerd..."
+        sudo sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+    fi
+    
+    echo -e "${GREEN}  ✓ Containerd configurado${NC}"
+    
+    # Reiniciar servicios
+    echo "  - Reiniciando servicios Docker y containerd..."
+    sudo systemctl daemon-reload
+    sudo systemctl restart containerd
+    sleep 2
+    sudo systemctl restart docker
+    sleep 3
+    
+    echo -e "${GREEN}✓ Docker configurado en modo compatible${NC}"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Configurar permisos del sistema para contenedores
 # ─────────────────────────────────────────────────────────────────────────────
 configure_system_permissions() {
@@ -125,25 +190,22 @@ configure_system_permissions() {
         # Recargar perfiles de AppArmor
         sudo systemctl reload apparmor.service 2>/dev/null || true
         
-        # Verificar el estado
-        if sudo aa-status 2>/dev/null | grep -q "docker"; then
-            echo -e "${GREEN}  ✓ AppArmor configurado${NC}"
-        else
-            echo -e "${YELLOW}  ⚠ AppArmor puede estar causando problemas${NC}"
-            echo "  Intentando poner Docker en modo complain..."
-            sudo aa-complain /etc/apparmor.d/docker 2>/dev/null || true
-        fi
+        echo -e "${GREEN}  ✓ AppArmor configurado${NC}"
     fi
-    
-    # Reiniciar Docker para aplicar cambios
-    echo "  - Reiniciando servicio Docker..."
-    sudo systemctl restart docker
-    sleep 3
-    echo -e "${GREEN}✓ Docker reiniciado${NC}"
 }
 
 # Verificar espacio en disco antes de comenzar
 check_disk_space
+
+# Verificar versión de Docker y configurar si es necesario
+DOCKER_VERSION=$(docker --version 2>/dev/null | grep -oP '\d+\.\d+\.\d+' | head -1)
+if [ -n "$DOCKER_VERSION" ]; then
+    MAJOR_VERSION=$(echo "$DOCKER_VERSION" | cut -d. -f1)
+    if [ "$MAJOR_VERSION" -ge 27 ]; then
+        echo -e "${YELLOW}⚠ Docker $DOCKER_VERSION detectado - Aplicando configuración de compatibilidad${NC}"
+        configure_docker_legacy_mode
+    fi
+fi
 
 # Configurar permisos del sistema
 configure_system_permissions
@@ -189,7 +251,27 @@ if ! command -v docker >/dev/null 2>&1; then
     sudo usermod -aG docker "$USER"
     echo -e "${GREEN}Docker instalado: $(docker --version)${NC}"
 else
+    DOCKER_VERSION=$(docker --version | grep -oP '\d+\.\d+\.\d+' | head -1)
     echo "Docker ya está instalado: $(docker --version)"
+    
+    # Verificar si es una versión problemática (27.x tiene problemas con sysctls)
+    MAJOR_VERSION=$(echo "$DOCKER_VERSION" | cut -d. -f1)
+    
+    if [ "$MAJOR_VERSION" -ge 27 ]; then
+        echo -e "${YELLOW}⚠ Versión de Docker $DOCKER_VERSION detectada${NC}"
+        echo -e "${YELLOW}  Esta versión puede tener problemas con sysctls en contenedores${NC}"
+        echo ""
+        echo "Opciones:"
+        echo "  1. Configurar Docker para usar runc legacy (recomendado)"
+        echo "  2. Downgrade a Docker 26.x (más invasivo)"
+        echo ""
+        read -p "¿Deseas configurar Docker en modo legacy? (s/n): " -n 1 -r
+        echo
+        
+        if [[ $REPLY =~ ^[Ss]$ ]]; then
+            configure_docker_legacy_mode
+        fi
+    fi
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -218,7 +300,7 @@ echo -e "${GREEN}✓ docker-compose.yml encontrado${NC}"
 # Crear docker-compose modificado con versión estable
 # ─────────────────────────────────────────────────────────────────────────────
 create_fixed_compose() {
-    echo "Creando configuración de Docker Compose con versión estable..."
+    echo "Verificando configuración de Docker Compose..."
     
     # Crear backup si no existe
     if [[ ! -f "$SCRIPT_DIR/docker-compose.yml.original" ]]; then
@@ -226,70 +308,11 @@ create_fixed_compose() {
         echo "  - Backup creado: docker-compose.yml.original"
     fi
     
-    # Usar versión específica conocida que funciona (v2.1.1 o v2.0.0)
-    # La versión :latest puede tener el bug de sysctls
-    cat > "$SCRIPT_DIR/docker-compose.yml" <<'EOF'
-services:
-  evolution_api:
-    container_name: evolution_api
-    image: atendai/evolution-api:v2.1.1
-    restart: always
-    depends_on:
-      - redis
-      - postgres
-    ports:
-      - ${EVOLUTION_API_PORT}:8080
-    volumes:
-      - evolution_instances:/evolution/instances
-    networks:
-      - evolution-net
-    env_file:
-      - .env
-    expose:
-      - 8080
-  redis:
-    image: redis:7-alpine
-    restart: always
-    networks:
-      - evolution-net
-    container_name: redis
-    command: >
-      redis-server --port 6379 --appendonly yes
-    volumes:
-      - evolution_redis:/data
-    ports:
-      - ${REDIS_PORT}:6379
-  postgres:
-    container_name: postgres
-    image: postgres:15-alpine
-    networks:
-      - evolution-net
-    command:
-      ["postgres", "-c", "max_connections=1000", "-c", "listen_addresses=*"]
-    restart: always
-    ports:
-      - ${POSTGRESS_PORT}:5432
-    environment:
-      - POSTGRES_USER=${POSTGRESS_USER}
-      - POSTGRES_PASSWORD=${POSTGRESS_PASS}
-      - POSTGRES_DB=evolution
-      - POSTGRES_HOST_AUTH_METHOD=trust
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    expose:
-      - 5432
-volumes:
-  evolution_instances:
-  evolution_redis:
-  postgres_data:
-networks:
-  evolution-net:
-    name: evolution-net
-    driver: bridge
-EOF
+    # Restaurar original y usar versión :latest
+    echo "  - Usando configuración original con imagen :latest"
+    cp "$SCRIPT_DIR/docker-compose.yml.original" "$SCRIPT_DIR/docker-compose.yml"
     
-    echo -e "${GREEN}✓ Docker Compose configurado con versión estable (v2.1.1)${NC}"
-    echo -e "${YELLOW}  Nota: Si v2.1.1 también falla, el script intentará con v2.0.0${NC}"
+    echo -e "${GREEN}✓ Docker Compose listo${NC}"
 }
 
 create_fixed_compose
@@ -356,44 +379,8 @@ else
     echo "Iniciando contenedores..."
     
     # Intentar iniciar con docker compose
-    if sudo docker compose -f "$SCRIPT_DIR/docker-compose.yml" up -d 2>&1 | tee /tmp/docker-compose-output.log; then
-        # Verificar si hay errores en el output
-        if grep -qi "permission denied.*sysctl" /tmp/docker-compose-output.log; then
-            echo -e "\n${YELLOW}⚠ Error de sysctls detectado en v2.1.1${NC}"
-            echo "Intentando con versión anterior (v2.0.0)..."
-            
-            # Limpiar
-            cleanup_failed_containers
-            
-            # Cambiar a versión anterior
-            sed -i 's/atendai\/evolution-api:v2.1.1/atendai\/evolution-api:v2.0.0/' "$SCRIPT_DIR/docker-compose.yml"
-            
-            echo "Descargando versión v2.0.0..."
-            sudo docker compose -f "$SCRIPT_DIR/docker-compose.yml" pull
-            
-            if sudo docker compose -f "$SCRIPT_DIR/docker-compose.yml" up -d; then
-                echo -e "${GREEN}✓ Servicios iniciados correctamente con v2.0.0${NC}"
-            else
-                echo -e "${RED}✗ Error persistente incluso con versión anterior${NC}"
-                echo ""
-                echo "Intentando con versión v1.7.4 (última versión v1 estable)..."
-                cleanup_failed_containers
-                sed -i 's/atendai\/evolution-api:v2.0.0/atendai\/evolution-api:v1.7.4/' "$SCRIPT_DIR/docker-compose.yml"
-                sudo docker compose -f "$SCRIPT_DIR/docker-compose.yml" pull
-                
-                if sudo docker compose -f "$SCRIPT_DIR/docker-compose.yml" up -d; then
-                    echo -e "${GREEN}✓ Servicios iniciados correctamente con v1.7.4${NC}"
-                else
-                    echo -e "${RED}✗ No se pudo iniciar con ninguna versión${NC}"
-                    echo ""
-                    echo "Logs de error:"
-                    sudo docker compose -f "$SCRIPT_DIR/docker-compose.yml" logs --tail=30
-                    exit 1
-                fi
-            fi
-        else
-            echo -e "${GREEN}✓ Servicios iniciados correctamente${NC}"
-        fi
+    if sudo docker compose -f "$SCRIPT_DIR/docker-compose.yml" up -d; then
+        echo -e "${GREEN}✓ Servicios iniciados correctamente${NC}"
     else
         echo -e "${RED}✗ Error al iniciar servicios${NC}"
         echo ""
@@ -408,9 +395,6 @@ else
         
         exit 1
     fi
-    
-    # Limpiar archivo temporal
-    rm -f /tmp/docker-compose-output.log
 fi
 
 CHECK_APP_MAX_ATTEMPTS=12
