@@ -215,10 +215,10 @@ fi
 echo -e "${GREEN}✓ docker-compose.yml encontrado${NC}"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Crear docker-compose modificado para evitar errores de sysctls
+# Crear docker-compose modificado con versión estable
 # ─────────────────────────────────────────────────────────────────────────────
 create_fixed_compose() {
-    echo "Creando configuración de Docker Compose optimizada..."
+    echo "Creando configuración de Docker Compose con versión estable..."
     
     # Crear backup si no existe
     if [[ ! -f "$SCRIPT_DIR/docker-compose.yml.original" ]]; then
@@ -226,12 +226,13 @@ create_fixed_compose() {
         echo "  - Backup creado: docker-compose.yml.original"
     fi
     
-    # Crear versión modificada con cap_add y privileged para evolution_api
+    # Usar versión específica conocida que funciona (v2.1.1 o v2.0.0)
+    # La versión :latest puede tener el bug de sysctls
     cat > "$SCRIPT_DIR/docker-compose.yml" <<'EOF'
 services:
   evolution_api:
     container_name: evolution_api
-    image: atendai/evolution-api:latest
+    image: atendai/evolution-api:v2.1.1
     restart: always
     depends_on:
       - redis
@@ -246,14 +247,8 @@ services:
       - .env
     expose:
       - 8080
-    cap_add:
-      - NET_ADMIN
-      - SYS_ADMIN
-    security_opt:
-      - apparmor=unconfined
-    privileged: true
   redis:
-    image: redis:latest
+    image: redis:7-alpine
     restart: always
     networks:
       - evolution-net
@@ -266,7 +261,7 @@ services:
       - ${REDIS_PORT}:6379
   postgres:
     container_name: postgres
-    image: postgres:15
+    image: postgres:15-alpine
     networks:
       - evolution-net
     command:
@@ -293,7 +288,8 @@ networks:
     driver: bridge
 EOF
     
-    echo -e "${GREEN}✓ Docker Compose configurado con permisos necesarios${NC}"
+    echo -e "${GREEN}✓ Docker Compose configurado con versión estable (v2.1.1)${NC}"
+    echo -e "${YELLOW}  Nota: Si v2.1.1 también falla, el script intentará con v2.0.0${NC}"
 }
 
 create_fixed_compose
@@ -352,14 +348,52 @@ else
     
     # Pull de las imágenes primero para mejor diagnóstico
     echo "Descargando imágenes de Docker..."
-    sudo docker compose -f "$SCRIPT_DIR/docker-compose.yml" pull
+    if ! sudo docker compose -f "$SCRIPT_DIR/docker-compose.yml" pull; then
+        echo -e "${YELLOW}⚠ Advertencia: No se pudieron descargar algunas imágenes${NC}"
+    fi
     
     echo ""
     echo "Iniciando contenedores..."
     
     # Intentar iniciar con docker compose
-    if sudo docker compose -f "$SCRIPT_DIR/docker-compose.yml" up -d; then
-        echo -e "${GREEN}✓ Servicios iniciados correctamente${NC}"
+    if sudo docker compose -f "$SCRIPT_DIR/docker-compose.yml" up -d 2>&1 | tee /tmp/docker-compose-output.log; then
+        # Verificar si hay errores en el output
+        if grep -qi "permission denied.*sysctl" /tmp/docker-compose-output.log; then
+            echo -e "\n${YELLOW}⚠ Error de sysctls detectado en v2.1.1${NC}"
+            echo "Intentando con versión anterior (v2.0.0)..."
+            
+            # Limpiar
+            cleanup_failed_containers
+            
+            # Cambiar a versión anterior
+            sed -i 's/atendai\/evolution-api:v2.1.1/atendai\/evolution-api:v2.0.0/' "$SCRIPT_DIR/docker-compose.yml"
+            
+            echo "Descargando versión v2.0.0..."
+            sudo docker compose -f "$SCRIPT_DIR/docker-compose.yml" pull
+            
+            if sudo docker compose -f "$SCRIPT_DIR/docker-compose.yml" up -d; then
+                echo -e "${GREEN}✓ Servicios iniciados correctamente con v2.0.0${NC}"
+            else
+                echo -e "${RED}✗ Error persistente incluso con versión anterior${NC}"
+                echo ""
+                echo "Intentando con versión v1.7.4 (última versión v1 estable)..."
+                cleanup_failed_containers
+                sed -i 's/atendai\/evolution-api:v2.0.0/atendai\/evolution-api:v1.7.4/' "$SCRIPT_DIR/docker-compose.yml"
+                sudo docker compose -f "$SCRIPT_DIR/docker-compose.yml" pull
+                
+                if sudo docker compose -f "$SCRIPT_DIR/docker-compose.yml" up -d; then
+                    echo -e "${GREEN}✓ Servicios iniciados correctamente con v1.7.4${NC}"
+                else
+                    echo -e "${RED}✗ No se pudo iniciar con ninguna versión${NC}"
+                    echo ""
+                    echo "Logs de error:"
+                    sudo docker compose -f "$SCRIPT_DIR/docker-compose.yml" logs --tail=30
+                    exit 1
+                fi
+            fi
+        else
+            echo -e "${GREEN}✓ Servicios iniciados correctamente${NC}"
+        fi
     else
         echo -e "${RED}✗ Error al iniciar servicios${NC}"
         echo ""
@@ -374,6 +408,9 @@ else
         
         exit 1
     fi
+    
+    # Limpiar archivo temporal
+    rm -f /tmp/docker-compose-output.log
 fi
 
 CHECK_APP_MAX_ATTEMPTS=12
