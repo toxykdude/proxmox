@@ -113,12 +113,33 @@ configure_system_permissions() {
         echo -e "${GREEN}✓ Permisos de puertos configurados${NC}"
     fi
     
-    # Verificar y aplicar configuración de AppArmor si es necesario
+    # Configurar AppArmor para Docker si está presente
     if command -v apparmor_status >/dev/null 2>&1; then
-        echo "  - AppArmor detectado, verificando configuración..."
-        # Recargar perfiles de AppArmor para Docker
+        echo "  - AppArmor detectado, configurando para Docker..."
+        
+        # Verificar si el perfil docker-default existe
+        if [ -f /etc/apparmor.d/docker ]; then
+            sudo apparmor_parser -r /etc/apparmor.d/docker 2>/dev/null || true
+        fi
+        
+        # Recargar perfiles de AppArmor
         sudo systemctl reload apparmor.service 2>/dev/null || true
+        
+        # Verificar el estado
+        if sudo aa-status 2>/dev/null | grep -q "docker"; then
+            echo -e "${GREEN}  ✓ AppArmor configurado${NC}"
+        else
+            echo -e "${YELLOW}  ⚠ AppArmor puede estar causando problemas${NC}"
+            echo "  Intentando poner Docker en modo complain..."
+            sudo aa-complain /etc/apparmor.d/docker 2>/dev/null || true
+        fi
     fi
+    
+    # Reiniciar Docker para aplicar cambios
+    echo "  - Reiniciando servicio Docker..."
+    sudo systemctl restart docker
+    sleep 3
+    echo -e "${GREEN}✓ Docker reiniciado${NC}"
 }
 
 # Verificar espacio en disco antes de comenzar
@@ -191,27 +212,47 @@ if [[ ! -f "$SCRIPT_DIR/docker-compose.yml" ]]; then
     exit 1
 fi
 
+echo -e "${GREEN}✓ docker-compose.yml encontrado${NC}"
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Detener y limpiar contenedores existentes en caso de error previo
 # ─────────────────────────────────────────────────────────────────────────────
 cleanup_failed_containers() {
-    echo "Verificando contenedores con errores..."
+    echo "Limpiando contenedores con errores..."
     
     # Detener contenedores que puedan estar en estado fallido
-    if sudo docker ps -a --format '{{.Names}}' | grep -q "evolution"; then
-        echo "  - Deteniendo contenedores Evolution existentes..."
-        sudo docker compose -f "$SCRIPT_DIR/docker-compose.yml" down 2>/dev/null || true
+    if sudo docker ps -a --format '{{.Names}}' | grep -E "(evolution|redis|postgres)" >/dev/null 2>&1; then
+        echo "  - Deteniendo contenedores existentes..."
+        sudo docker compose -f "$SCRIPT_DIR/docker-compose.yml" down -v 2>/dev/null || true
+        sleep 3
+        
+        # Forzar eliminación de contenedores que no se detuvieron
+        for container in $(sudo docker ps -a --format '{{.Names}}' | grep -E "(evolution|redis|postgres)"); do
+            echo "  - Eliminando contenedor: $container"
+            sudo docker rm -f "$container" 2>/dev/null || true
+        done
+        
         sleep 2
     fi
+    
+    # Limpiar redes que puedan estar en conflicto
+    if sudo docker network ls | grep -q "evolution-net"; then
+        echo "  - Eliminando red evolution-net..."
+        sudo docker network rm evolution-net 2>/dev/null || true
+    fi
+    
+    # Limpiar volúmenes huérfanos
+    echo "  - Limpiando volúmenes..."
+    sudo docker volume prune -f >/dev/null 2>&1 || true
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Instalación de Evolution API (si no está instalado)
+# Instalación de Evolution API
 # ─────────────────────────────────────────────────────────────────────────────
 if sudo docker ps --format '{{.Names}}' | grep -q "evolution_api"; then
     echo "Evolution API ya está ejecutándose."
 else
-    echo "Instalando Evolution API y servicios (corriendo docker-compose.yml) ..."
+    echo "Instalando Evolution API y servicios..."
     echo "Directorio de trabajo: $SCRIPT_DIR"
     
     # Limpiar contenedores fallidos si existen
@@ -220,25 +261,56 @@ else
     # Ejecutar docker compose desde el directorio del script
     cd "$SCRIPT_DIR"
     
-    echo "Iniciando servicios..."
-    if sudo docker compose -f "$SCRIPT_DIR/docker-compose.yml" up -d; then
-        echo -e "${GREEN}Evolution API y servicios instalados correctamente${NC}"
-    else
-        echo -e "${RED}Error al iniciar los servicios. Intentando con configuración alternativa...${NC}"
-        
-        # Reintentar con privilegios adicionales si falló
-        echo "Reintentando instalación..."
-        sudo docker compose -f "$SCRIPT_DIR/docker-compose.yml" down 2>/dev/null || true
-        sleep 3
-        
-        if sudo docker compose -f "$SCRIPT_DIR/docker-compose.yml" up -d; then
-            echo -e "${GREEN}Evolution API y servicios instalados correctamente${NC}"
+    echo ""
+    echo "Iniciando servicios con Docker Compose..."
+    echo "Esto puede tardar algunos minutos mientras se descargan las imágenes..."
+    echo ""
+    
+    # Intentar iniciar con docker compose y capturar errores
+    if sudo docker compose -f "$SCRIPT_DIR/docker-compose.yml" up -d 2>&1 | tee /tmp/docker-compose-output.log; then
+        # Verificar que no haya errores en el output
+        if grep -qi "error\|failed" /tmp/docker-compose-output.log; then
+            ERROR_OUTPUT=$(cat /tmp/docker-compose-output.log)
+            
+            if echo "$ERROR_OUTPUT" | grep -q "permission denied"; then
+                echo -e "\n${YELLOW}⚠ Error de permisos detectado. Aplicando solución...${NC}"
+                
+                # Deshabilitar temporalmente AppArmor para Docker
+                if command -v aa-status >/dev/null 2>&1; then
+                    echo "  - Deshabilitando restricciones de AppArmor..."
+                    sudo systemctl stop apparmor 2>/dev/null || true
+                    sudo systemctl disable apparmor 2>/dev/null || true
+                fi
+                
+                # Limpiar e intentar nuevamente
+                echo "  - Limpiando y reiniciando Docker..."
+                cleanup_failed_containers
+                sudo systemctl restart docker
+                sleep 5
+                
+                echo "  - Reintentando inicio de servicios..."
+                if sudo docker compose -f "$SCRIPT_DIR/docker-compose.yml" up -d; then
+                    echo -e "${GREEN}✓ Servicios iniciados correctamente${NC}"
+                else
+                    echo -e "${RED}✗ Error persistente. Verifica los logs manualmente.${NC}"
+                    exit 1
+                fi
+            else
+                echo -e "${RED}✗ Error desconocido al iniciar servicios.${NC}"
+                cat /tmp/docker-compose-output.log
+                exit 1
+            fi
         else
-            echo -e "${RED}Error persistente al iniciar servicios.${NC}"
-            echo "Verifica los logs con: sudo docker compose -f $SCRIPT_DIR/docker-compose.yml logs"
-            exit 1
+            echo -e "${GREEN}✓ Servicios iniciados correctamente${NC}"
         fi
+    else
+        echo -e "${RED}✗ Error al ejecutar docker compose.${NC}"
+        cat /tmp/docker-compose-output.log
+        exit 1
     fi
+    
+    # Limpiar archivo temporal
+    rm -f /tmp/docker-compose-output.log
 fi
 
 CHECK_APP_MAX_ATTEMPTS=12
