@@ -241,37 +241,85 @@ else
     fi
 fi
 
-CHECK_APP_MAX_ATTEMPTS=5
+CHECK_APP_MAX_ATTEMPTS=12
 CHECK_APP_DELAY_SECONDS=5
 
 # Función para validar que un puerto esté accesible localmente
 # Recibe Puerto y Nombre de la Aplicación
 # Realiza hasta CHECK_APP_MAX_ATTEMPTS intentos con CHECK_APP_DELAY_SECONDS segundos de delay. 
-# Si tras CHECK_APP_MAX_ATTEMPTS fallos, muestra error y termina.
 check_local_port() {
     local PORT=$1
     local APP_NAME=$2
     local attempt=1
 
+    echo "Esperando a que ${APP_NAME} esté listo..."
+
     while ((attempt <= CHECK_APP_MAX_ATTEMPTS)); do
+        echo -e "  Intento ${attempt}/${CHECK_APP_MAX_ATTEMPTS}: Verificando acceso local a ${APP_NAME}..."
 
-        echo -e "Verificando acceso local a ${APP_NAME} . . . "
-
-        sleep ${CHECK_APP_DELAY_SECONDS}
-        
-        # Verificar respuesta local (localhost/127.0.0.1)
-        if nc -z -w5 127.0.0.1 "${PORT}"; then
-            echo -e "${GREEN}¡Instalación completada! ${APP_NAME} funcionando localmente en: http://localhost:${PORT}${NC}"
-            return 0
+        # Verificar si el contenedor está corriendo
+        if sudo docker ps --format '{{.Names}}' | grep -q "evolution"; then
+            # Verificar respuesta local (localhost/127.0.0.1)
+            if nc -z -w5 127.0.0.1 "${PORT}" 2>/dev/null; then
+                echo -e "${GREEN}✓ ¡Instalación completada! ${APP_NAME} funcionando localmente en: http://localhost:${PORT}${NC}"
+                return 0
+            elif curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:${PORT}" 2>/dev/null | grep -q "[2-5][0-9][0-9]"; then
+                echo -e "${GREEN}✓ ¡Instalación completada! ${APP_NAME} funcionando localmente en: http://localhost:${PORT}${NC}"
+                return 0
+            else
+                echo "    Puerto aún no disponible, esperando..."
+            fi
+        else
+            echo -e "${YELLOW}    Contenedor aún no está corriendo, esperando...${NC}"
         fi
+        
+        sleep ${CHECK_APP_DELAY_SECONDS}
         attempt=$((attempt + 1))
     done
 
     # Si llegamos aquí, todos los intentos fallaron
-    echo -e "${RED}Error: El puerto ${PORT} para ${APP_NAME} no es accesible localmente en localhost:${PORT}. Verifica que el contenedor esté ejecutándose correctamente.${NC}"
+    echo -e "${RED}✗ Error: El puerto ${PORT} para ${APP_NAME} no es accesible después de ${CHECK_APP_MAX_ATTEMPTS} intentos.${NC}"
+    echo ""
+    echo "Diagnóstico:"
+    echo "1. Estado de los contenedores:"
+    sudo docker ps -a | grep -E "(CONTAINER|evolution)"
+    echo ""
+    echo "2. Logs recientes de Evolution API:"
+    sudo docker compose -f "$SCRIPT_DIR/docker-compose.yml" logs --tail=30 2>/dev/null || echo "   No se pudieron obtener los logs"
+    echo ""
+    echo "3. Puertos en uso:"
+    sudo netstat -tlnp | grep ":${PORT}" || sudo ss -tlnp | grep ":${PORT}" || echo "   Puerto ${PORT} no está en uso"
+    echo ""
+    echo "Para más detalles, ejecuta:"
+    echo "  sudo docker compose -f $SCRIPT_DIR/docker-compose.yml logs -f"
+    
+    return 1
 }
 
-check_local_port "${EVOLUTION_API_PORT}" "Evolution API"
+# Verificar disponibilidad del puerto
+if check_local_port "${EVOLUTION_API_PORT}" "Evolution API"; then
+    echo -e "\n${GREEN}========================================${NC}"
+    echo -e "${GREEN}   Instalación completada exitosamente${NC}"
+    echo -e "${GREEN}========================================${NC}"
+    echo ""
+    echo "Accede a Evolution API en: http://localhost:${EVOLUTION_API_PORT}"
+    echo ""
+    echo "Comandos útiles:"
+    echo "  - Ver logs: sudo docker compose -f $SCRIPT_DIR/docker-compose.yml logs -f"
+    echo "  - Detener servicios: sudo docker compose -f $SCRIPT_DIR/docker-compose.yml down"
+    echo "  - Reiniciar servicios: sudo docker compose -f $SCRIPT_DIR/docker-compose.yml restart"
+else
+    echo -e "\n${YELLOW}========================================${NC}"
+    echo -e "${YELLOW}   Instalación completada con warnings${NC}"
+    echo -e "${YELLOW}========================================${NC}"
+    echo ""
+    echo "Los servicios fueron instalados pero no responden aún en el puerto esperado."
+    echo "Esto puede ser normal si los contenedores necesitan más tiempo para iniciar."
+    echo ""
+    echo "Verifica el estado con:"
+    echo "  sudo docker compose -f $SCRIPT_DIR/docker-compose.yml ps"
+    echo "  sudo docker compose -f $SCRIPT_DIR/docker-compose.yml logs -f"
+fi
 
 # Refrescar grupos para la sesión actual
 newgrp docker
